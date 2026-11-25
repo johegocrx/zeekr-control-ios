@@ -1,0 +1,85 @@
+name: Build Zeekr Control IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 15.4
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Downgrade project format for Xcode 15
+        run: |
+          PBXPROJ="ZeekrControl.xcodeproj/project.pbxproj"
+          sed -i.bak 's/objectVersion = [0-9]*;/objectVersion = 56;/g' $PBXPROJ
+          rm $PBXPROJ.bak
+
+      - name: Build unsigned
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project ZeekrControl.xcodeproj \
+            -scheme ZeekrControl \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/ \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log
+
+      - name: Find .app and package IPA
+        run: |
+          set -e
+          APP_PATH=$(find build -name "ZeekrControl.app" -path "*Release-iphoneos*" 2>/dev/null | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: .app not found"
+            find build -name "*.app" 2>/dev/null
+            exit 1
+          fi
+          APP_PATH="$APP_PATH" python3 - <<'PY'
+          import os, zipfile, shutil
+          app_path = os.environ.get("APP_PATH")
+          workspace = os.path.join(os.getcwd(), "_ipa_build")
+          if os.path.isdir(workspace):
+              shutil.rmtree(workspace)
+          os.makedirs(workspace)
+          payload = os.path.join(workspace, "Payload")
+          os.makedirs(payload)
+          target = os.path.join(payload, "ZeekrControl.app")
+          shutil.copytree(app_path, target)
+          with zipfile.ZipFile("Zeekr-Control.ipa", "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for root, dirs, files in os.walk(payload):
+                  for f in files:
+                      full = os.path.join(root, f)
+                      rel = os.path.relpath(full, workspace).replace(os.sep, "/")
+                      zf.write(full, rel)
+          size = os.path.getsize("Zeekr-Control.ipa")
+          print(f"IPA built: {size} bytes")
+          shutil.rmtree(workspace)
+          PY
+          ls -la Zeekr-Control.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zeekr-Control-unsigned
+          path: Zeekr-Control.ipa
+          if-no-files-found: error
+          retention-days: 30
